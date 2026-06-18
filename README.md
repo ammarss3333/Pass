@@ -1,49 +1,84 @@
-# Ammar Passwords - Ultimate Hardware Vault (v10.1)
+# Password Vault Pro for LilyGO T-Display-S3
 
-> **🤖 AI CONTEXT MODULE:** 
-> Hello fellow AI! If you have been fed this README, you are assisting with the "Ammar Passwords" hardware password manager. This is a 100% offline, air-gapped, AES-256-GCM encrypted vault built specifically for the **LilyGO T-Display-S3** microcontroller. 
-> 
-> **CRITICAL ARCHITECTURE NOTE:** To maintain absolute stability across different LilyGO hardware batches, **PSRAM is strictly DISABLED**. The entire vault runs in the ESP32-S3's internal SRAM. Dynamic memory is carefully managed. Do not suggest adding features that require massive memory buffers (like storing large plain-text secure notes for hundreds of entries). The maximum safe capacity is ~200-300 credentials.
+An offline hardware password vault for the **ESP32-S3 LilyGO T-Display-S3**. The device stores credentials in an AES-256-GCM encrypted LittleFS vault, exposes a local-only Wi-Fi access point for management, and can type credentials through USB HID and Bluetooth HID.
 
----
+> **Hardware target:** LilyGO T-Display-S3 standard non-touch model. PSRAM is intentionally disabled for stability across board batches.
 
-## 🛠 Hardware Specifications
-* **Board:** LilyGO T-Display-S3 (Standard version, **Non-Touch**)
-* **Microcontroller:** ESP32-S3
-* **Display:** 1.9" ST7789 LCD (8-bit Parallel Interface, *NOT* standard SPI)
-* **Connectivity:** Wi-Fi (Local AP only), Bluetooth LE, Native USB-C
-* **Hardware Pins in Use:**
-  * `PIN_POWER_ON (15)`: Must be pulled HIGH on boot to power the screen and radios.
-  * `TFT_BL (38)`: Screen backlight.
-  * `BTN_NAV (0)`: Top physical button (Short press = Next Entry, Long press = Previous Entry).
-  * `BTN_TYPE (14)`: Bottom physical button (Injects credentials via HID).
+## Features
 
----
+- **Encrypted vault at rest** using AES-256-GCM with PBKDF2-HMAC-SHA256 key derivation.
+- **Offline management portal** hosted by the ESP32-S3 SoftAP at `http://192.168.4.1`.
+- **Physical session password** displayed on the TFT at boot and required with the master PIN.
+- **Decoy vault mode** for a separate, isolated vault protected by a different PIN.
+- **USB and BLE credential injection** for username/password and TOTP workflows.
+- **On-device navigation** with the two physical buttons.
+- **Responsive web UI** with search, sorting, favorites, pagination, password generator, strength hints, and maintenance actions.
+- **TOTP support** for Base32 secrets after browser time synchronization.
 
-## ⚙️ Required IDE & Compiler Settings
-Failure to use these exact settings in the Arduino IDE will result in a silent crash at `entry 0x403c98d0` or a boot-loop.
+## Security Model
 
-* **Board:** ESP32S3 Dev Module
-* **USB Mode:** Hardware CDC and JTAG *(Required for native USB Keyboard HID)*
-* **USB CDC On Boot:** Enabled
-* **Flash Mode:** DIO 80MHz
-* **Flash Size:** 16MB (128Mb)
-* **Partition Scheme:** 8M with spiffs (3MB APP/1.5MB SPIFFS)
-* **PSRAM:** Disabled *(Crucial for stability across batches)*
+This project is designed for local, offline use. It is not a cloud password manager and should not be exposed to the internet.
 
----
+Security controls include:
 
-## 📚 Library Dependencies & Fixes
+- Master PIN is never stored on disk.
+- Vault records are encrypted before being written to LittleFS.
+- Session cookies are `HttpOnly` and `SameSite=Strict`.
+- HTTP responses use no-store cache headers and basic content-security headers.
+- User-supplied fields are length-limited and sanitized before serialization.
+- TOTP secrets are validated as Base32 before saving.
+- Failed unlock attempts are delayed after repeated failures.
 
-1. **`mbedtls`**: Built-in ESP32 core library used for AES-256-GCM and PBKDF2 cryptography.
-2. **`LittleFS`**: Built-in ESP32 core library used for saving the encrypted `.bin` vaults.
-3. **`USBHIDKeyboard` & `USB`**: Built-in ESP32 core libraries for native USB typing.
-4. **`ESP32-BLE-Keyboard` (by T-vK)**: For Bluetooth typing.
-   * *Note: A preprocessor macro `#define KeyReport BleKeyReport` is used in the main `.ino` file to prevent a naming collision between the Native USB and BLE libraries.*
-5. **`TFT_eSPI` (by Bodmer)**: Display driver.
+Before production use:
 
-### 🚨 Critical `TFT_eSPI` Configuration
-The default `User_Setup.h` will fatally crash this specific board. The `TFT_eSPI/User_Setup.h` file **must** contain this exact 8-bit parallel configuration:
+1. Change `AP_PASS`, `BLE_NAME`, and `BLE_PASSKEY` in `PasswordVaultPro_OPTIMIZED.ino`.
+2. Use a strong master PIN or passphrase of 6-64 characters.
+3. Keep encrypted backups in multiple safe locations.
+4. Enable destructive wipe only after backups and recovery have been tested.
+
+## Hardware
+
+| Component | Requirement |
+| --- | --- |
+| Board | LilyGO T-Display-S3 standard non-touch version |
+| MCU | ESP32-S3 |
+| Display | 1.9-inch ST7789 LCD over 8-bit parallel bus |
+| Storage | Internal flash with LittleFS partition |
+| USB | Native USB-C with CDC/JTAG and HID support |
+| Buttons | GPIO 0 navigation, GPIO 14 type/inject |
+
+### Pins
+
+| Pin | Purpose |
+| --- | --- |
+| `15` | `PIN_POWER_ON`; must be driven HIGH on boot |
+| `38` | TFT backlight |
+| `0` | Navigation button |
+| `14` | Type/inject button |
+
+## Arduino IDE Configuration
+
+Use these settings for the LilyGO T-Display-S3:
+
+- **Board:** ESP32S3 Dev Module
+- **USB Mode:** Hardware CDC and JTAG
+- **USB CDC On Boot:** Enabled
+- **Flash Mode:** DIO 80 MHz
+- **Flash Size:** 16 MB (128 Mb)
+- **Partition Scheme:** 8M with spiffs (3MB APP / 1.5MB SPIFFS)
+- **PSRAM:** Disabled
+
+## Dependencies
+
+Install or enable the following libraries:
+
+- ESP32 Arduino core with `WiFi`, `WebServer`, `DNSServer`, `LittleFS`, `Preferences`, `USB`, `USBHIDKeyboard`, and `mbedtls`.
+- [`TFT_eSPI`](https://github.com/Bodmer/TFT_eSPI) by Bodmer.
+- `ESP32-BLE-Keyboard` by T-vK.
+
+## Required TFT_eSPI Setup
+
+Configure `TFT_eSPI/User_Setup.h` for the LilyGO T-Display-S3 8-bit parallel display:
 
 ```cpp
 #define USER_SETUP_ID 206
@@ -78,41 +113,74 @@ The default `User_Setup.h` will fatally crash this specific board. The `TFT_eSPI
 #define LOAD_FONT8
 #define LOAD_GFXFF
 #define SMOOTH_FONT
-🚀 Feature Set (v10.1 Ultimate)
-Security & Cryptography
-AES-256-GCM Encryption: Vault is heavily encrypted at rest. The Master PIN is never stored.  
+```
 
-Air-Gapped UI: Managed entirely via a locally broadcasted, WPA2-protected Wi-Fi Access Point (192.168.4.1).  
+## Installation
 
-Decoy Vault System: Entering a secondary "Decoy PIN" creates/decrypts a completely separate decoy.bin file to protect the main vault under duress.
+1. Clone this repository.
+2. Open `PasswordVaultPro_OPTIMIZED.ino` in Arduino IDE.
+3. Update the configuration constants near the top of the file:
+   - `AP_SSID`
+   - `AP_PASS`
+   - `BLE_NAME`
+   - `BLE_PASSKEY`
+   - optional lockout and wipe policy values
+4. Confirm the Arduino IDE board settings listed above.
+5. Compile and upload to the LilyGO T-Display-S3.
+6. Reboot the device and verify the TFT shows the access point address and session password.
 
-Physical 2FA Session Password: On boot, the ESP32 generates a 12-character complex password displayed only on its physical screen. This must be typed into the Web UI alongside the Master PIN to unlock the vault.
+## Usage
 
-Hardware UI (TFT Screen)
-Camouflage Mode (Locked): Displays a fake "System Monitor" clock and disguises the 2FA session password.
+1. Connect a phone or computer to the device Wi-Fi network.
+2. Open `http://192.168.4.1`.
+3. On first run, create the master PIN/passphrase.
+4. On subsequent unlocks, enter both:
+   - master PIN/passphrase
+   - session password displayed on the physical screen
+5. Add credentials from the web UI.
+6. Use search, sort, favorites, and pagination to navigate larger vaults.
+7. Press the device type button to inject the selected credential. For entries with TOTP, the first press types the password and the second press types the current TOTP code.
 
-Screensaver (Idle): After 10 seconds of inactivity, hides credential data and displays a large digital clock with a wake-up trap (pressing any button wakes the screen without executing an action).
+## Web UI Navigation
 
-Active Mode (Unlocked): Displays the current credential label, username, and live-updating 6-digit TOTP codes.
+The vault UI avoids long scrolling by combining:
 
-Credential Injection (HID)
-Dual-Injection: Pressing the bottom button injects keystrokes via USB-C and Bluetooth simultaneously.
+- **Search** for filtering labels and usernames.
+- **Sort modes** for smart favorites-first ordering, A-Z, Z-A, and weak-password-first review.
+- **Pagination** with 12 visible records per page, keeping the interface fast on mobile devices and within ESP32 memory limits.
+- **Favorites and grouped sections** for quick access to high-priority credentials.
 
-Sequential Typing: If a credential has a TOTP secret, the first button press types the password. The UI updates to prompt for 2FA, and the second button press types the live 6-digit TOTP code.
+## Internal File Layout
 
-Web Interface (JavaScript/HTML)
-Embedded as a compressed string in the C++ firmware.
+LittleFS paths used by the firmware:
 
-Features Dark/Light theme toggling, live vault statistics (Total, Favs, Weak passwords), password strength meter, and advanced password generator (Length, Numbers, Symbols).
+| Path | Purpose |
+| --- | --- |
+| `/vault.bin` | Primary encrypted vault |
+| `/decoy.bin` | Decoy encrypted vault |
+| `/vault.bak` | Reserved backup path |
+| `/vault.tmp` | Reserved temporary upload path |
+| `/import.csv` | Reserved temporary import path |
 
-Smart Sorting: Automatically groups Favorites (⭐) at the top, followed by remaining entries alphabetically.
+## Limitations
 
-📂 File Structure (Internal LittleFS)
-  
-/vault.bin: The primary encrypted vault database.
+- Intended capacity is approximately 200 credentials.
+- The local web portal uses HTTP because it runs on a SoftAP microcontroller; do not bridge or expose the AP to untrusted networks.
+- Browser clipboard APIs may require a secure context on some platforms; manual reveal remains available.
+- TOTP requires opening the web UI once after boot so browser time can sync to the device.
 
-/decoy.bin: The secondary (dummy) encrypted vault database.
+## Contributing
 
-/vault.tmp: Temporary upload file during backup restoration.
+Contributions should preserve the offline-first threat model and ESP32-S3 memory constraints.
 
-/import.csv: Temporary storage during mobile CSV imports (deleted immediately after processing).
+When contributing:
+
+- Keep PSRAM disabled unless a separate hardware-specific build is documented.
+- Avoid large dynamic buffers and long-lived plaintext copies.
+- Do not add cloud synchronization or external network dependencies.
+- Validate all user input and avoid exposing sensitive diagnostics to the web UI.
+- Test on the LilyGO T-Display-S3 standard non-touch board before submitting changes.
+
+## License
+
+Add your preferred license before distributing this project publicly.
