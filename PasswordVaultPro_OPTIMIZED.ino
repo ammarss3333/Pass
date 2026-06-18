@@ -30,8 +30,9 @@
 #include "USBHIDKeyboard.h"
 
 // ============================ CONFIG (edit me) ==============================
-static const char* AP_SSID      = "MyDevice";   
-static const char* AP_PASS      = "changeit";     
+static const char* AP_SSID      = "Vault-S3";
+// WPA2 AP password must be 8+ characters. Change this before flashing.
+static const char* AP_PASS      = "change-me-32chars";
 
 static const char* BLE_NAME     = "MyDevice";     
 static const bool  BLE_REQUIRE_PASSKEY = true;
@@ -40,7 +41,7 @@ static const uint32_t BLE_PASSKEY      = 123456;
 static const uint32_t LOCK_MS   = 5UL * 60UL * 1000UL; 
 static const uint32_t SAVER_MS  = 10UL * 1000UL;       
 
-static const int  PBKDF2_ITERS  = 50000;               
+static const int  PBKDF2_ITERS  = 120000;
 static const int  DELAY_THRESHOLD = 3;     
 static const bool WIPE_ENABLED    = false; 
 static const int  WIPE_THRESHOLD  = 10;    
@@ -62,6 +63,11 @@ static const char* BAK_PATH   = "/vault.bak";
 static const char* TMP_PATH   = "/vault.tmp";
 static const char* CSV_PATH   = "/import.csv";
 static const int   MAX_ENTRIES = 200;
+static const size_t MAX_LABEL_LEN = 64;
+static const size_t MAX_USER_LEN  = 96;
+static const size_t MAX_PASS_LEN  = 128;
+static const size_t MAX_TOTP_LEN  = 96;
+static const size_t MAX_PIN_LEN   = 64;
 
 static const char US = (char)0x1F;
 static const char RS = (char)0x1E;
@@ -114,6 +120,8 @@ uint32_t nowEpoch() { return g_timeSynced ? g_timeBase + (millis()-g_timeAtMs)/1
 
 File g_upFile;
 
+int base32Decode(const String& in, uint8_t* out, int maxOut);
+
 // =========================== Small utilities ===============================
 void fillRandom(uint8_t* b, size_t n) {
   for (size_t i = 0; i < n;) { uint32_t r = esp_random();
@@ -133,6 +141,20 @@ String jsonEsc(const String& in) {
     } } return o;
 }
 String sanitize(String s) { s.replace(String(US),""); s.replace(String(RS),""); return s; }
+String truncateField(String s, size_t maxLen) { return s.length() > maxLen ? s.substring(0, maxLen) : s; }
+bool validPin(const String& pin) { return pin.length() >= 6 && pin.length() <= MAX_PIN_LEN; }
+bool validTotpSecret(const String& secret) {
+  if (secret.length() == 0) return true;
+  if (secret.length() > MAX_TOTP_LEN) return false;
+  uint8_t tmp[64];
+  return base32Decode(secret, tmp, sizeof(tmp)) > 0;
+}
+void sendJson(int code, const String& body) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.sendHeader("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'");
+  server.send(code, "application/json", body);
+}
 
 // ============================ Sort Vault (Favs First) ======================
 void sortVault() {
@@ -399,10 +421,16 @@ details summary{cursor:pointer;color:var(--text-sec);font-size:13px;margin:8px 0
 .fav-btn{color:var(--border);background:none;border:none;padding:0;font-size:18px;cursor:pointer} .fav-btn.active{color:var(--fav)}
 .head-flex{display:flex;justify-content:space-between;align-items:start}
 .theme-btn{background:none;border:1px solid var(--border);color:var(--text);font-size:18px;padding:4px 8px}
+.toolbar{display:grid;grid-template-columns:1fr auto;gap:8px;margin-bottom:10px}
+.pager{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:10px 0}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 </style>)css";
 
 void sendHtml(const String& body) {
   String p = FPSTR(STYLE);
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.sendHeader("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'");
   p += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   p += "<div class='wrap'>" + body + "</div>";
   server.send(200, "text/html", p);
@@ -418,7 +446,7 @@ void pageSetup() {
     "<button class='full' onclick='setup()'>Initialize System</button></div>"
     "<script>"
     "function setup(){var a=p1.value,b=p2.value;"
-    "if(a.length<4){m.innerText='PIN must be at least 4 characters';return;}"
+    "if(a.length<6||a.length>64){m.innerText='PIN must be 6-64 characters';return;}"
     "if(a!=b){m.innerText='PINs do not match';return;}"
     "fetch('/setup',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
     "body:'pin='+encodeURIComponent(a)}).then(r=>r.json()).then(j=>{if(j.ok)location.href='/';else m.innerText=j.error||'Failed';});}"
@@ -464,8 +492,12 @@ void pageMain() {
       "<a class='tog pill' href='#' onclick='lock();return false' style='color:var(--warn)'>Lock Vault</a>"
     "</div>"
     
-    "<input id='q' placeholder='Search domains, users, tags...' oninput='render()'>"
+    "<div class='toolbar'>"
+      "<div><label class='sr-only' for='q'>Search credentials</label><input id='q' placeholder='Search domains, users, tags...' oninput='page=1;render()'></div>"
+      "<div><label for='sort'>Sort</label><select id='sort' onchange='page=1;render()'><option value='smart'>Smart</option><option value='az'>A-Z</option><option value='za'>Z-A</option><option value='weak'>Weak first</option></select></div>"
+    "</div>"
     "<div id='list'></div>"
+    "<div class='pager'><button class='sec sm' onclick='prevPage()'>Previous</button><span class='pill' id='pageinfo'>Page 1</span><button class='sec sm' onclick='nextPage()'>Next</button></div>"
     
     // Add/Edit Form
     "<div class='card' style='margin-top:20px'><div class='elabel' id='formtitle'>Create Entry</div>"
@@ -509,7 +541,7 @@ void pageMain() {
 }
 
 const char MAIN_JS[] PROGMEM = R"js(
-var DATA=[]; var editId=0; 
+var DATA=[]; var editId=0; var page=1; var pageSize=12; var filteredCount=0;
 // Theme Init
 if(localStorage.getItem('theme')==='dark') document.documentElement.setAttribute('data-theme','dark');
 function toggleTheme() {
@@ -552,16 +584,32 @@ function updateDash(arr) {
   document.getElementById('s-weak').innerText = arr.filter(e=>e.weak).length;
 }
 
+function sortedItems(arr){
+  var mode=document.getElementById('sort')?document.getElementById('sort').value:'smart';
+  return arr.slice().sort((a,b)=>{
+    if(mode==='weak' && a.weak!==b.weak) return a.weak?-1:1;
+    if(mode==='za') return (b.label||'').localeCompare(a.label||'', undefined, {sensitivity:'base'});
+    if(mode==='smart' && a.fav!==b.fav) return a.fav?-1:1;
+    return (a.label||'').localeCompare(b.label||'', undefined, {sensitivity:'base'});
+  });
+}
+function prevPage(){ if(page>1){page--;render();} }
+function nextPage(){ if(page*pageSize<filteredCount){page++;render();} }
+
 function render(){
   var q=(document.getElementById('q').value||'').toLowerCase();
-  var arr=DATA.filter(e=>!q||(e.label+' '+e.user).toLowerCase().indexOf(q)>=0);
+  var arr=sortedItems(DATA.filter(e=>!q||(e.label+' '+e.user).toLowerCase().indexOf(q)>=0));
   updateDash(DATA); // Update dash based on total data
   
   if(!arr.length){document.getElementById('list').innerHTML="<div class='card' style='text-align:center'>No records found.</div>";return;}
+  filteredCount=arr.length;
+  var pages=Math.max(1,Math.ceil(filteredCount/pageSize)); if(page>pages) page=pages;
+  var visible=arr.slice((page-1)*pageSize,page*pageSize);
+  document.getElementById('pageinfo').innerText='Page '+page+' / '+pages+' · '+filteredCount+' shown';
   
   // Grouping: Favs first, then Alphabetical Folders
-  var favs = arr.filter(e=>e.fav);
-  var others = arr.filter(e=>!e.fav);
+  var favs = visible.filter(e=>e.fav);
+  var others = visible.filter(e=>!e.fav);
   
   var h='';
   if(favs.length) h += buildGroup('★ Favorites', favs);
@@ -585,6 +633,7 @@ function buildGroup(title, items) {
     "<button class='sm sec' onclick=\"tp("+e.id+",'pass')\">Pass</button>"+
     "<button class='sm sec' onclick=\"show("+e.id+")\">View</button>"+
     "<button class='sm sec' onclick=\"edit("+e.id+")\">Edit</button>"+
+    "<button class='sm warn' onclick=\"delEntry("+e.id+")\">Delete</button>"+
     "</div></div><div class='reveal' id='r"+e.id+"'></div></div>";
   });
   return h + "</div>";
@@ -592,14 +641,17 @@ function buildGroup(title, items) {
 
 function tp(id,mode){fetch('/api/type',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+id+'&mode='+mode}).then(r=>r.json()).then(j=>{if(!j.ok)alert(j.error||'Type failed');});}
 function toggleFav(id) { fetch('/api/fav',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+id}).then(()=>load()); }
+function delEntry(id){if(confirm('Delete this credential?'))fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+id}).then(()=>load());}
 
 function show(id){var el=document.getElementById('r'+id);
   if(el.style.display=='block'){el.style.display='none';return;}
   fetch('/api/secret?id='+id).then(r=>r.json()).then(j=>{
     var code=j.totp?(' | 2FA: '+j.totp):'';
     el.innerHTML='USR: '+esc(j.user)+'<br>PWD: '+esc(j.pass)+code+
-      "<br><button class='sm sec' style='margin-top:6px' onclick=\"navigator.clipboard.writeText('"+(j.pass||'').replace(/'/g,"\\'")+"')\">Copy Pass</button>";
+      "<br><button class='sm sec' style='margin-top:6px' onclick=\"copyPass("+id+")\">Copy Pass</button>";
+    el.dataset.pass=j.pass||'';
     el.style.display='block';});}
+function copyPass(id){var el=document.getElementById('r'+id);navigator.clipboard.writeText(el.dataset.pass||'');}
 
 function edit(id){var e=DATA.find(x=>x.id==id);if(!e)return;
   fetch('/api/secret?id='+id).then(r=>r.json()).then(j=>{
@@ -614,6 +666,7 @@ function clearForm(){editId=0;nl.value='';nu.value='';np.value='';nt.value='';nf
   document.getElementById('cancel').style.display='none';am.innerText='';}
 
 function save(){var l=nl.value.trim();if(!l){am.innerText='Label required';return;}
+  if(l.length>64||nu.value.length>96||np.value.length>128||nt.value.length>96){am.innerText='One or more fields exceeds the allowed length.';return;}
   var body=(editId?'id='+editId+'&':'')+'label='+encodeURIComponent(l)+'&user='+encodeURIComponent(nu.value)+
     '&pass='+encodeURIComponent(np.value)+'&totp='+encodeURIComponent(nt.value)+
     '&enter='+ne.value+'&spd='+nd.value+'&fav='+(nf.checked?'1':'0');
@@ -622,10 +675,10 @@ function save(){var l=nl.value.trim();if(!l){am.innerText='Label required';retur
 
 function setupDecoy(){
   var p=prompt("Enter a new PIN for the Decoy Vault:");
-  if(p&&p.length>=4){
+  if(p&&p.length>=6&&p.length<=64){
     fetch('/api/setup_decoy',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'pin='+encodeURIComponent(p)})
     .then(r=>r.json()).then(j=>{if(j.ok){alert("Decoy Created. Lock vault and test the new PIN.");}else{alert("Failed");}});
-  }else if(p){alert("PIN too short");}
+  }else if(p){alert("PIN must be 6-64 characters");}
 }
 
 function setble(on){if(confirm('Restarts device. Continue?')){fetch('/api/setble?on='+on,{method:'POST'});}}
@@ -646,16 +699,16 @@ void handleRoot() {
 void handleSetup() {
   if (vaultExists()) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Vault exists\"}"); return; }
   String pin = server.arg("pin");
-  if (pin.length()<4) { server.send(200,"application/json","{\"ok\":false,\"error\":\"PIN too short\"}"); return; }
+  if (!validPin(pin)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"PIN must be 6-64 characters\"}"); return; }
   if (createVault(pin, false)) { saveFail(0); newSession();
-    server.sendHeader("Set-Cookie","sid="+g_session+"; Path=/; HttpOnly");
+    server.sendHeader("Set-Cookie","sid="+g_session+"; Path=/; HttpOnly; SameSite=Strict");
     server.send(200,"application/json","{\"ok\":true}");
   } else server.send(200,"application/json","{\"ok\":false,\"error\":\"Create failed\"}");
 }
 void apiSetupDecoy() {
   if (!authed()) { server.send(401,"application/json","{\"error\":\"locked\"}"); return; }
   String pin = server.arg("pin");
-  if (pin.length()<4) { server.send(200,"application/json","{\"ok\":false,\"error\":\"PIN too short\"}"); return; }
+  if (!validPin(pin)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"PIN must be 6-64 characters\"}"); return; }
   // Save current main vault state to memory
   std::vector<Entry> backup = g_entries;
   uint16_t b_id = g_nextId;
@@ -685,7 +738,7 @@ void handleUnlock() {
   int res = unlockVault(pin);
   if (res == 0) {
     saveFail(0); newSession();
-    server.sendHeader("Set-Cookie","sid="+g_session+"; Path=/; HttpOnly");
+    server.sendHeader("Set-Cookie","sid="+g_session+"; Path=/; HttpOnly; SameSite=Strict");
     server.send(200,"application/json","{\"ok\":true}");
   } else if (res == 2) {
     server.send(200,"application/json","{\"ok\":false,\"msg\":\"Low memory - restarting...\"}"); delay(300); ESP.restart();
@@ -746,10 +799,10 @@ void apiSecret() {
 }
 
 void fillFromArgs(Entry& e) {
-  e.label = sanitize(server.arg("label"));
-  e.user  = sanitize(server.arg("user"));
-  e.pass  = sanitize(server.arg("pass"));
-  e.totp  = sanitize(server.arg("totp")); e.totp.replace(" ","");
+  e.label = truncateField(sanitize(server.arg("label")), MAX_LABEL_LEN);
+  e.user  = truncateField(sanitize(server.arg("user")), MAX_USER_LEN);
+  e.pass  = truncateField(sanitize(server.arg("pass")), MAX_PASS_LEN);
+  e.totp  = truncateField(sanitize(server.arg("totp")), MAX_TOTP_LEN); e.totp.replace(" ","");
   e.enter = (server.arg("enter")=="1");
   e.fav   = (server.arg("fav")=="1");
   int spd = server.arg("spd").toInt(); if (spd<0) spd=0;
@@ -760,9 +813,11 @@ void apiAdd() {
   if (!authed()) { server.send(401,"application/json","{\"error\":\"locked\"}"); return; }
   if ((int)g_entries.size() >= MAX_ENTRIES) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Vault is full\"}"); return; }
   
-  String nLabel = sanitize(server.arg("label"));
-  String nUser = sanitize(server.arg("user"));
+  String nLabel = truncateField(sanitize(server.arg("label")), MAX_LABEL_LEN);
+  String nUser = truncateField(sanitize(server.arg("user")), MAX_USER_LEN);
   if (nLabel.length()==0) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Label required\"}"); return; }
+  String nTotp = truncateField(sanitize(server.arg("totp")), MAX_TOTP_LEN); nTotp.replace(" ","");
+  if (!validTotpSecret(nTotp)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Invalid TOTP secret\"}"); return; }
   
   // Duplicate Check
   for(auto& existing : g_entries) {
@@ -780,7 +835,9 @@ void apiUpdate() {
   if (!authed()) { server.send(401,"application/json","{\"error\":\"locked\"}"); return; }
   Entry* e = findEntry((uint16_t)server.arg("id").toInt());
   if (!e) { server.send(404,"application/json","{\"ok\":false,\"error\":\"not found\"}"); return; }
-  if (sanitize(server.arg("label")).length()==0) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Label required\"}"); return; }
+  if (truncateField(sanitize(server.arg("label")), MAX_LABEL_LEN).length()==0) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Label required\"}"); return; }
+  String nTotp = truncateField(sanitize(server.arg("totp")), MAX_TOTP_LEN); nTotp.replace(" ","");
+  if (!validTotpSecret(nTotp)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Invalid TOTP secret\"}"); return; }
   
   uint16_t id = e->id; Entry tmp; tmp.id=id; fillFromArgs(tmp);
   *e = tmp;
@@ -799,6 +856,7 @@ void apiFav() {
   if (!authed()) { server.send(401,"application/json","{\"error\":\"locked\"}"); return; }
   Entry* e = findEntry((uint16_t)server.arg("id").toInt());
   if (e) { e->fav = !e->fav; saveVault(); server.send(200,"application/json","{\"ok\":true}"); }
+  else { server.send(404,"application/json","{\"ok\":false,\"error\":\"not found\"}"); }
 }
 
 void apiType() {
