@@ -51,11 +51,10 @@ static const uint32_t BLE_PASSKEY      = 123456;
 static const uint32_t LOCK_MS   = 5UL * 60UL * 1000UL;
 static const uint32_t SAVER_MS  = 10UL * 1000UL;
 
-// v10.1 vaults were encrypted with 50k PBKDF2 iterations. Keep the legacy
-// value above so upgraded devices can unlock and migrate existing vaults.
-static const int  DELAY_THRESHOLD = 3;
-static const bool WIPE_ENABLED    = false;
-static const int  WIPE_THRESHOLD  = 10;
+static const int  PBKDF2_ITERS  = 120000;
+static const int  DELAY_THRESHOLD = 3;     
+static const bool WIPE_ENABLED    = false; 
+static const int  WIPE_THRESHOLD  = 10;    
 
 static const bool BLE_DEFAULT_ON  = true;
 static const bool AP_DEFAULT_HIDDEN = false;
@@ -285,11 +284,10 @@ int tryUnlockFile(const char* path, const String& pin) {
   mbedtls_gcm_free(&g);
 
   bool usedLegacyKdf = false;
-  const int legacyKdfIterations = PBKDF2_LEGACY_ITERS;
-  if (ret != 0 && legacyKdfIterations != PBKDF2_ITERS) {
+  if (ret != 0 && PBKDF2_LEGACY_ITERS != PBKDF2_ITERS) {
     memset(key,0,32);
     if (cl) memset(pt,0,cl);
-    if (!deriveKeyWithIterations(pin,salt,legacyKdfIterations,key)){ free(ct); free(pt); return 2; }
+    if (!deriveKeyWithIterations(pin,salt,PBKDF2_LEGACY_ITERS,key)){ free(ct); free(pt); return 2; }
     mbedtls_gcm_init(&g); ret = -1;
     if (mbedtls_gcm_setkey(&g,MBEDTLS_CIPHER_ID_AES,key,256)==0)
       ret = mbedtls_gcm_auth_decrypt(&g,cl,iv,12,NULL,0,tag,16,ct,pt);
@@ -532,14 +530,14 @@ void pageMain() {
       "<span class='pill' id='ble'>BLE: ...</span>"
       "<a class='tog pill' href='#' onclick='lock();return false' style='color:var(--warn)'>Lock Vault</a>"
     "</div>"
-
+    
     "<div class='toolbar'>"
       "<div><label class='sr-only' for='q'>Search credentials</label><input id='q' placeholder='Search domains, users, tags...' oninput='page=1;render()'></div>"
       "<div><label for='sort'>Sort</label><select id='sort' onchange='page=1;render()'><option value='smart'>Smart</option><option value='az'>A-Z</option><option value='za'>Z-A</option><option value='weak'>Weak first</option></select></div>"
     "</div>"
     "<div id='list'></div>"
     "<div class='pager'><button class='sec sm' onclick='prevPage()'>Previous</button><span class='pill' id='pageinfo'>Page 1</span><button class='sec sm' onclick='nextPage()'>Next</button></div>"
-
+    
     // Add/Edit Form
     "<div class='card' style='margin-top:20px'><div class='elabel' id='formtitle'>Create Entry</div>"
       "<input id='nl' placeholder='Platform / Website (e.g. Github)'>"
@@ -647,11 +645,11 @@ function render(){
   var pages=Math.max(1,Math.ceil(filteredCount/pageSize)); if(page>pages) page=pages;
   var visible=arr.slice((page-1)*pageSize,page*pageSize);
   document.getElementById('pageinfo').innerText='Page '+page+' / '+pages+' · '+filteredCount+' shown';
-
+  
   // Grouping: Favs first, then Alphabetical Folders
   var favs = visible.filter(e=>e.fav);
   var others = visible.filter(e=>!e.fav);
-
+  
   var h='';
   if(favs.length) h += buildGroup('★ Favorites', favs);
 
@@ -853,13 +851,13 @@ void fillFromArgs(Entry& e) {
 void apiAdd() {
   if (!authed()) { server.send(401,"application/json","{\"error\":\"locked\"}"); return; }
   if ((int)g_entries.size() >= MAX_ENTRIES) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Vault is full\"}"); return; }
-
+  
   String nLabel = truncateField(sanitize(server.arg("label")), MAX_LABEL_LEN);
   String nUser = truncateField(sanitize(server.arg("user")), MAX_USER_LEN);
   if (nLabel.length()==0) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Label required\"}"); return; }
   String nTotp = truncateField(sanitize(server.arg("totp")), MAX_TOTP_LEN); nTotp.replace(" ","");
   if (!validTotpSecret(nTotp)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Invalid TOTP secret\"}"); return; }
-
+  
   // Duplicate Check
   for(auto& existing : g_entries) {
       if(existing.label.equalsIgnoreCase(nLabel) && existing.user.equalsIgnoreCase(nUser)) {
@@ -879,7 +877,7 @@ void apiUpdate() {
   if (truncateField(sanitize(server.arg("label")), MAX_LABEL_LEN).length()==0) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Label required\"}"); return; }
   String nTotp = truncateField(sanitize(server.arg("totp")), MAX_TOTP_LEN); nTotp.replace(" ","");
   if (!validTotpSecret(nTotp)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Invalid TOTP secret\"}"); return; }
-
+  
   uint16_t id = e->id; Entry tmp; tmp.id=id; fillFromArgs(tmp);
   *e = tmp;
   if (saveVault()) server.send(200,"application/json","{\"ok\":true}");
