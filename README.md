@@ -28,7 +28,6 @@ Security controls include:
 - User-supplied fields are length-limited and sanitized before serialization.
 - TOTP secrets are validated as Base32 before saving.
 - Failed unlock attempts are delayed after repeated failures.
-- Vaults created by older firmware using 50,000 PBKDF2 iterations are accepted and automatically rewritten with the current 120,000-iteration setting after a successful unlock.
 
 Before production use:
 
