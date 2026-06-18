@@ -29,6 +29,16 @@
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 
+// KDF constants are intentionally defined before any functions. Some Arduino
+// IDE/ESP32-S3 preprocessor combinations report a false "not declared in this
+// scope" error when these are typed globals in an .ino sketch.
+#ifndef PBKDF2_ITERS
+#define PBKDF2_ITERS 120000
+#endif
+#ifndef PBKDF2_LEGACY_ITERS
+#define PBKDF2_LEGACY_ITERS 50000
+#endif
+
 // ============================ CONFIG (edit me) ==============================
 static const char* AP_SSID      = "Vault-S3";
 // WPA2 AP password must be 8+ characters. Change this before flashing.
