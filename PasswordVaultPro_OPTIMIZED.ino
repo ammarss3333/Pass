@@ -1,6 +1,6 @@
 /*
   ============================================================================
-   AMMAR PASSWORDS  v10.1 ULTIMATE  -  LilyGO T-Display-S3 
+   AMMAR PASSWORDS  v10.1 ULTIMATE  -  LilyGO T-Display-S3
    (Themes, Stats, Decoy Vault, Favs, Adv Gen, Fast Scroll, UI Overhaul)
   ============================================================================
 */
@@ -11,17 +11,17 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <vector>
-#include <algorithm> 
+#include <algorithm>
 #include "mbedtls/md.h"
 #include "mbedtls/gcm.h"
 #include "mbedtls/pkcs5.h"
 #include "esp_system.h"
 
 // Hardware specific
-#include <TFT_eSPI.h> 
+#include <TFT_eSPI.h>
 #include <SPI.h>
 
-// HID Keyboards 
+// HID Keyboards
 #define KeyReport BleKeyReport
 #include <BleKeyboard.h>
 #undef KeyReport
@@ -30,38 +30,50 @@
 #include "USBHIDKeyboard.h"
 
 // ============================ CONFIG (edit me) ==============================
-static const char* AP_SSID      = "MyDevice";   
-static const char* AP_PASS      = "changeit";     
+static const char* AP_SSID      = "Vault-S3";
+// WPA2 AP password must be 8+ characters. Change this before flashing.
+static const char* AP_PASS      = "change-me-32chars";
 
-static const char* BLE_NAME     = "MyDevice";     
+static const char* BLE_NAME     = "MyDevice";
 static const bool  BLE_REQUIRE_PASSKEY = true;
 static const uint32_t BLE_PASSKEY      = 123456;
 
-static const uint32_t LOCK_MS   = 5UL * 60UL * 1000UL; 
-static const uint32_t SAVER_MS  = 10UL * 1000UL;       
+static const uint32_t LOCK_MS   = 5UL * 60UL * 1000UL;
+static const uint32_t SAVER_MS  = 10UL * 1000UL;
 
-static const int  PBKDF2_ITERS  = 50000;               
-static const int  DELAY_THRESHOLD = 3;     
-static const bool WIPE_ENABLED    = false; 
-static const int  WIPE_THRESHOLD  = 10;    
+// Use preprocessor constants here instead of typed globals because Arduino's
+// sketch preprocessor can produce confusing scope errors on some IDE/core
+// combinations when generated prototypes and .ino globals are rearranged.
+#define PBKDF2_ITERS 120000
+// v10.1 vaults were encrypted with 50k PBKDF2 iterations. The compatibility
+// retry uses a local literal in tryUnlockFile() to avoid Arduino preprocessor
+// scope issues with an extra global constant on some ESP32-S3 core versions.
+static const int  DELAY_THRESHOLD = 3;
+static const bool WIPE_ENABLED    = false;
+static const int  WIPE_THRESHOLD  = 10;
 
-static const bool BLE_DEFAULT_ON  = true;  
+static const bool BLE_DEFAULT_ON  = true;
 static const bool AP_DEFAULT_HIDDEN = false;
-static const uint32_t AP_TIMEOUT_MIN = 0;  
+static const uint32_t AP_TIMEOUT_MIN = 0;
 
-#define PIN_POWER_ON 15 
-#define TFT_BL 38       
-#define BTN_NAV 0       
-#define BTN_TYPE 14     
+#define PIN_POWER_ON 15
+#define TFT_BL 38
+#define BTN_NAV 0
+#define BTN_TYPE 14
 
 // ===========================================================================
 
 static const char* VAULT_PATH = "/vault.bin";
-static const char* DECOY_PATH = "/decoy.bin"; 
+static const char* DECOY_PATH = "/decoy.bin";
 static const char* BAK_PATH   = "/vault.bak";
 static const char* TMP_PATH   = "/vault.tmp";
 static const char* CSV_PATH   = "/import.csv";
 static const int   MAX_ENTRIES = 200;
+static const size_t MAX_LABEL_LEN = 64;
+static const size_t MAX_USER_LEN  = 96;
+static const size_t MAX_PASS_LEN  = 128;
+static const size_t MAX_TOTP_LEN  = 96;
+static const size_t MAX_PIN_LEN   = 64;
 
 static const char US = (char)0x1F;
 static const char RS = (char)0x1E;
@@ -80,18 +92,19 @@ struct Entry {
   String   label, user, pass, totp;
   bool     enter;
   uint8_t  spd;
-  bool     fav; 
+  bool     fav;
 };
 
 std::vector<Entry> g_entries;
 uint16_t g_nextId   = 1;
 bool     g_unlocked = false;
-bool     g_isDecoy  = false; 
+bool     g_isDecoy  = false;
+bool     g_needsKdfMigration = false;
 uint8_t  g_key[32];
 uint8_t  g_salt[16];
 String   g_session  = "";
 uint32_t g_lastSeen = 0;
-String   g_bootPass  = ""; 
+String   g_bootPass  = "";
 
 // Hardware Button State
 int      g_selectedIndex = 0;
@@ -99,7 +112,7 @@ bool     btnNavLast = HIGH;
 uint32_t btnNavPressTime = 0;
 uint32_t lastFastScroll = 0;
 uint32_t lastBtnType = 0;
-bool     g_typeTotpNext = false; 
+bool     g_typeTotpNext = false;
 
 bool     g_bleEnabled = true;
 bool     g_bleStarted = false;
@@ -113,6 +126,8 @@ bool     g_timeSynced = false;
 uint32_t nowEpoch() { return g_timeSynced ? g_timeBase + (millis()-g_timeAtMs)/1000UL : 0; }
 
 File g_upFile;
+
+int base32Decode(const String& in, uint8_t* out, int maxOut);
 
 // =========================== Small utilities ===============================
 void fillRandom(uint8_t* b, size_t n) {
@@ -133,13 +148,27 @@ String jsonEsc(const String& in) {
     } } return o;
 }
 String sanitize(String s) { s.replace(String(US),""); s.replace(String(RS),""); return s; }
+String truncateField(String s, size_t maxLen) { return s.length() > maxLen ? s.substring(0, maxLen) : s; }
+bool validPin(const String& pin) { return pin.length() >= 6 && pin.length() <= MAX_PIN_LEN; }
+bool validTotpSecret(const String& secret) {
+  if (secret.length() == 0) return true;
+  if (secret.length() > MAX_TOTP_LEN) return false;
+  uint8_t tmp[64];
+  return base32Decode(secret, tmp, sizeof(tmp)) > 0;
+}
+void sendJson(int code, const String& body) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.sendHeader("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'");
+  server.send(code, "application/json", body);
+}
 
 // ============================ Sort Vault (Favs First) ======================
 void sortVault() {
   std::sort(g_entries.begin(), g_entries.end(), [](const Entry& a, const Entry& b) {
-    if (a.fav != b.fav) return a.fav > b.fav; 
+    if (a.fav != b.fav) return a.fav > b.fav;
     // Fix: Use strcasecmp for standard C++ case-insensitive string comparison
-    return strcasecmp(a.label.c_str(), b.label.c_str()) < 0; 
+    return strcasecmp(a.label.c_str(), b.label.c_str()) < 0;
   });
 }
 
@@ -154,12 +183,15 @@ void loadSettings() {
 void saveBool(const char* k, bool v) { prefs.begin("ammar", false); prefs.putBool(k, v); prefs.end(); }
 void saveFail(int v) { g_failCount = v; prefs.begin("ammar", false); prefs.putInt("fail", v); prefs.end(); }
 
-bool deriveKey(const String& pin, const uint8_t* salt, uint8_t* out) {
+bool deriveKeyWithIterations(const String& pin, const uint8_t* salt, int iterations, uint8_t* out) {
   mbedtls_md_context_t c; mbedtls_md_init(&c);
   const mbedtls_md_info_t* i = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
   if (mbedtls_md_setup(&c, i, 1) != 0) { mbedtls_md_free(&c); return false; }
-  int r = mbedtls_pkcs5_pbkdf2_hmac(&c, (const unsigned char*)pin.c_str(), pin.length(), salt, 16, PBKDF2_ITERS, 32, out);
+  int r = mbedtls_pkcs5_pbkdf2_hmac(&c, (const unsigned char*)pin.c_str(), pin.length(), salt, 16, iterations, 32, out);
   mbedtls_md_free(&c); return r == 0;
+}
+bool deriveKey(const String& pin, const uint8_t* salt, uint8_t* out) {
+  return deriveKeyWithIterations(pin, salt, PBKDF2_ITERS, out);
 }
 bool hmacSha1(const uint8_t* k, size_t kl, const uint8_t* m, size_t ml, uint8_t* out) {
   const mbedtls_md_info_t* i = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
@@ -194,7 +226,7 @@ String serializeVault() {
   for (auto& e : g_entries) {
     s += String(e.id); s+=US; s+=e.label; s+=US; s+=e.user; s+=US; s+=e.pass; s+=US;
     s += e.totp; s+=US; s += (e.enter?"1":"0"); s+=US; s += String(e.spd); s+=US;
-    s += (e.fav?"1":"0"); s+=RS; 
+    s += (e.fav?"1":"0"); s+=RS;
   } return s;
 }
 void parseVault(const String& s) {
@@ -208,14 +240,14 @@ void parseVault(const String& s) {
     while (fi<8){ int us=rec.indexOf(US,p); if (us<0){ f[fi++]=rec.substring(p); break; }
       f[fi++]=rec.substring(p,us); p=us+1; }
     Entry e; e.id=(uint16_t)f[0].toInt(); e.label=f[1]; e.user=f[2]; e.pass=f[3];
-    e.totp=f[4]; e.enter=(f[5]=="1"); e.spd=(uint8_t)f[6].toInt(); 
-    e.fav=(f[7]=="1"); 
+    e.totp=f[4]; e.enter=(f[5]=="1"); e.spd=(uint8_t)f[6].toInt();
+    e.fav=(f[7]=="1");
     g_entries.push_back(e);
   }
-  sortVault(); 
+  sortVault();
 }
 bool saveVault() {
-  sortVault(); 
+  sortVault();
   String plain = serializeVault(); size_t pl = plain.length();
   uint8_t iv[12]; fillRandom(iv,12); uint8_t tag[16];
   uint8_t* ct = (uint8_t*)malloc(pl?pl:1); if (!ct) return false;
@@ -224,16 +256,16 @@ bool saveVault() {
   if (ok) ok = (mbedtls_gcm_crypt_and_tag(&g,MBEDTLS_GCM_ENCRYPT,pl,iv,12,NULL,0,(const unsigned char*)plain.c_str(),ct,16,tag)==0);
   mbedtls_gcm_free(&g);
   if (!ok){ free(ct); return false; }
-  
-  File f = LittleFS.open(g_isDecoy ? DECOY_PATH : VAULT_PATH,"w"); 
+
+  File f = LittleFS.open(g_isDecoy ? DECOY_PATH : VAULT_PATH,"w");
   if (!f){ free(ct); return false; }
-  
+
   f.write(g_salt,16); f.write(iv,12); f.write(tag,16); if (pl) f.write(ct,pl);
   f.close(); free(ct); return true;
 }
 
 int tryUnlockFile(const char* path, const String& pin) {
-  File f = LittleFS.open(path,"r"); if (!f) return 1; 
+  File f = LittleFS.open(path,"r"); if (!f) return 1;
   size_t total = f.size(); if (total<44){ f.close(); return 2; }
   uint8_t salt[16],iv[12],tag[16];
   f.read(salt,16); f.read(iv,12); f.read(tag,16);
@@ -245,32 +277,58 @@ int tryUnlockFile(const char* path, const String& pin) {
   mbedtls_gcm_context g; mbedtls_gcm_init(&g); int ret = -1;
   if (mbedtls_gcm_setkey(&g,MBEDTLS_CIPHER_ID_AES,key,256)==0)
     ret = mbedtls_gcm_auth_decrypt(&g,cl,iv,12,NULL,0,tag,16,ct,pt);
-  mbedtls_gcm_free(&g); free(ct); ct=nullptr;                            
+  mbedtls_gcm_free(&g);
+
+  bool usedLegacyKdf = false;
+  const int legacyKdfIterations = 50000;
+  if (ret != 0 && legacyKdfIterations != PBKDF2_ITERS) {
+    memset(key,0,32);
+    if (cl) memset(pt,0,cl);
+    if (!deriveKeyWithIterations(pin,salt,legacyKdfIterations,key)){ free(ct); free(pt); return 2; }
+    mbedtls_gcm_init(&g); ret = -1;
+    if (mbedtls_gcm_setkey(&g,MBEDTLS_CIPHER_ID_AES,key,256)==0)
+      ret = mbedtls_gcm_auth_decrypt(&g,cl,iv,12,NULL,0,tag,16,ct,pt);
+    mbedtls_gcm_free(&g);
+    usedLegacyKdf = (ret == 0);
+  }
+
+  free(ct); ct=nullptr;
   if (ret != 0) { memset(key,0,32); if(cl) memset(pt,0,cl); free(pt); return 1; }
-  
+
   String plain; plain.reserve(cl+1);
   if (!plain.concat((const char*)pt, cl)) { memset(key,0,32); if(cl) memset(pt,0,cl); free(pt); return 2; }
   if (cl) memset(pt,0,cl); free(pt); pt=nullptr;
-  
-  parseVault(plain); plain = String();                                
+
+  parseVault(plain); plain = String();
+  if (usedLegacyKdf) {
+    // Migrate the in-memory key to the stronger iteration count; the caller
+    // rewrites the vault once unlock completes so the next boot uses 120k.
+    if (!deriveKey(pin,salt,key)) { memset(key,0,32); return 2; }
+    g_needsKdfMigration = true;
+  }
   memcpy(g_key,key,32); memcpy(g_salt,salt,16); memset(key,0,32);
   return 0;
 }
 
 int unlockVault(const String& pin) {
   std::vector<Entry>().swap(g_entries);
-  
+  g_needsKdfMigration = false;
+
   int res = tryUnlockFile(VAULT_PATH, pin);
-  if (res == 0) { 
-      g_isDecoy = false; g_unlocked = true; 
-      g_selectedIndex = 0; g_typeTotpNext = false; return 0; 
+  if (res == 0) {
+      g_isDecoy = false; g_unlocked = true;
+      g_selectedIndex = 0; g_typeTotpNext = false;
+      if (g_needsKdfMigration) { saveVault(); g_needsKdfMigration = false; }
+      return 0;
   }
-  
+
   if (res == 1 && LittleFS.exists(DECOY_PATH)) {
       res = tryUnlockFile(DECOY_PATH, pin);
-      if (res == 0) { 
-          g_isDecoy = true; g_unlocked = true; 
-          g_selectedIndex = 0; g_typeTotpNext = false; return 0; 
+      if (res == 0) {
+          g_isDecoy = true; g_unlocked = true;
+          g_selectedIndex = 0; g_typeTotpNext = false;
+          if (g_needsKdfMigration) { saveVault(); g_needsKdfMigration = false; }
+          return 0;
       }
   }
   return res;
@@ -278,12 +336,12 @@ int unlockVault(const String& pin) {
 
 bool createVault(const String& pin, bool asDecoy = false) {
   fillRandom(g_salt,16); if (!deriveKey(pin,g_salt,g_key)) return false;
-  g_entries.clear(); g_nextId=1; g_unlocked=true; g_isDecoy = asDecoy;
+  g_entries.clear(); g_nextId=1; g_unlocked=true; g_isDecoy = asDecoy; g_needsKdfMigration = false;
   return saveVault();
 }
 
 void lockVault() {
-  g_unlocked=false; g_session=""; memset(g_key,0,32); g_isDecoy = false;
+  g_unlocked=false; g_session=""; memset(g_key,0,32); g_isDecoy = false; g_needsKdfMigration = false;
   for (auto& e:g_entries){ e.pass=""; e.totp=""; e.user=""; e.label=""; }
   std::vector<Entry>().swap(g_entries);
 }
@@ -322,7 +380,7 @@ String genPassword(int len) {
 // ============================ Advanced Auto-Type ===========================
 void configureBleSecurity() {
   uint32_t passkey = BLE_PASSKEY;
-  esp_ble_auth_req_t auth = ESP_LE_AUTH_REQ_SC_MITM_BOND; 
+  esp_ble_auth_req_t auth = ESP_LE_AUTH_REQ_SC_MITM_BOND;
   esp_ble_io_cap_t  iocap = ESP_IO_CAP_OUT;
   uint8_t ksize = 16;
   uint8_t ikey  = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
@@ -339,27 +397,27 @@ void startBleIfEnabled() {
 }
 
 void typeText(const String& t, uint8_t per) {
-  uint8_t d = per ? per : 8; 
-  for (size_t i = 0; i < t.length(); i++) { 
-    if (bleKeyboard.isConnected()) bleKeyboard.print(t[i]); 
-    usbKeyboard.print(t[i]); delay(d); 
+  uint8_t d = per ? per : 8;
+  for (size_t i = 0; i < t.length(); i++) {
+    if (bleKeyboard.isConnected()) bleKeyboard.print(t[i]);
+    usbKeyboard.print(t[i]); delay(d);
   }
 }
 
 bool doType(Entry* e, const String& mode) {
   bool bleReady = bleKeyboard.isConnected();
-  
+
   if (mode=="user") typeText(e->user,e->spd);
   else if (mode=="pass") typeText(e->pass,e->spd);
   else if (mode=="totp") { if (!g_timeSynced) return false; typeText(totpCode(e->totp,nowEpoch()),e->spd); }
   else if (mode=="both"||mode=="bothenter") {
-    typeText(e->user,e->spd); delay(40); 
-    if(bleReady) bleKeyboard.write(KEY_TAB); usbKeyboard.write(KEY_TAB); 
+    typeText(e->user,e->spd); delay(40);
+    if(bleReady) bleKeyboard.write(KEY_TAB); usbKeyboard.write(KEY_TAB);
     delay(40); typeText(e->pass,e->spd);
   } else return false;
-  
-  if (mode=="bothenter" || (e->enter && mode!="user")) { 
-    delay(40); if(bleReady) bleKeyboard.write(KEY_RETURN); usbKeyboard.write(KEY_RETURN); 
+
+  if (mode=="bothenter" || (e->enter && mode!="user")) {
+    delay(40); if(bleReady) bleKeyboard.write(KEY_RETURN); usbKeyboard.write(KEY_RETURN);
   }
   return true;
 }
@@ -399,10 +457,16 @@ details summary{cursor:pointer;color:var(--text-sec);font-size:13px;margin:8px 0
 .fav-btn{color:var(--border);background:none;border:none;padding:0;font-size:18px;cursor:pointer} .fav-btn.active{color:var(--fav)}
 .head-flex{display:flex;justify-content:space-between;align-items:start}
 .theme-btn{background:none;border:1px solid var(--border);color:var(--text);font-size:18px;padding:4px 8px}
+.toolbar{display:grid;grid-template-columns:1fr auto;gap:8px;margin-bottom:10px}
+.pager{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:10px 0}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 </style>)css";
 
 void sendHtml(const String& body) {
   String p = FPSTR(STYLE);
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.sendHeader("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'");
   p += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   p += "<div class='wrap'>" + body + "</div>";
   server.send(200, "text/html", p);
@@ -418,7 +482,7 @@ void pageSetup() {
     "<button class='full' onclick='setup()'>Initialize System</button></div>"
     "<script>"
     "function setup(){var a=p1.value,b=p2.value;"
-    "if(a.length<4){m.innerText='PIN must be at least 4 characters';return;}"
+    "if(a.length<6||a.length>64){m.innerText='PIN must be 6-64 characters';return;}"
     "if(a!=b){m.innerText='PINs do not match';return;}"
     "fetch('/setup',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
     "body:'pin='+encodeURIComponent(a)}).then(r=>r.json()).then(j=>{if(j.ok)location.href='/';else m.innerText=j.error||'Failed';});}"
@@ -450,7 +514,7 @@ void pageMain() {
   String b =
     "<div class='head-flex'><div><h1>Credential Vault</h1><div class='sub' id='vtype'>Secure Storage</div></div>"
     "<button class='theme-btn' onclick='toggleTheme()'>🌓</button></div>"
-    
+
     // Security Dashboard
     "<div class='dash'>"
       "<div class='stat'><div class='stat-val' id='s-tot'>0</div><div class='stat-lbl'>Total</div></div>"
@@ -463,10 +527,14 @@ void pageMain() {
       "<span class='pill' id='ble'>BLE: ...</span>"
       "<a class='tog pill' href='#' onclick='lock();return false' style='color:var(--warn)'>Lock Vault</a>"
     "</div>"
-    
-    "<input id='q' placeholder='Search domains, users, tags...' oninput='render()'>"
+
+    "<div class='toolbar'>"
+      "<div><label class='sr-only' for='q'>Search credentials</label><input id='q' placeholder='Search domains, users, tags...' oninput='page=1;render()'></div>"
+      "<div><label for='sort'>Sort</label><select id='sort' onchange='page=1;render()'><option value='smart'>Smart</option><option value='az'>A-Z</option><option value='za'>Z-A</option><option value='weak'>Weak first</option></select></div>"
+    "</div>"
     "<div id='list'></div>"
-    
+    "<div class='pager'><button class='sec sm' onclick='prevPage()'>Previous</button><span class='pill' id='pageinfo'>Page 1</span><button class='sec sm' onclick='nextPage()'>Next</button></div>"
+
     // Add/Edit Form
     "<div class='card' style='margin-top:20px'><div class='elabel' id='formtitle'>Create Entry</div>"
       "<input id='nl' placeholder='Platform / Website (e.g. Github)'>"
@@ -477,7 +545,7 @@ void pageMain() {
         "</div>"
         "<div style='flex:1'><button class='sec full' onclick='openGen()'>⚙️ Gen</button></div>"
       "</div>"
-      
+
       // Advanced Generator Modal (Hidden by default)
       "<div id='genUI' style='display:none;background:var(--bg);padding:10px;border-radius:6px;margin:8px 0;border:1px solid var(--border)'>"
         "<div class='row' style='padding:4px 0'><span>Length (<span id='g-len-val'>16</span>)</span><input type='range' id='g-len' min='8' max='32' value='16' oninput='document.getElementById(\"g-len-val\").innerText=this.value'></div>"
@@ -495,7 +563,7 @@ void pageMain() {
       "<button class='full' onclick='save()'>Save Credential</button>"
       "<button class='sec full' id='cancel' style='display:none;margin-top:6px' onclick='clearForm()'>Cancel</button>"
     "</div>"
-    
+
     // Settings
     "<details><summary>System Settings & Maintenance</summary><div class='card'>"
       "<div class='row'><div>Bluetooth Interface</div><div class='btns'><button class='sm sec' onclick='setble(1)'>Enable</button><button class='sm warn' onclick='setble(0)'>Disable</button></div></div>"
@@ -503,13 +571,13 @@ void pageMain() {
       "<div class='row'><div>Encrypted Backup</div><div class='btns'><button class='sm sec' onclick='expt()'>Download</button></div></div>"
       "<div class='msg' id='sm'></div>"
     "</div></details>"
-    
+
     "<script>" + String(MAIN_JS) + "</script>";
   sendHtml(b);
 }
 
 const char MAIN_JS[] PROGMEM = R"js(
-var DATA=[]; var editId=0; 
+var DATA=[]; var editId=0; var page=1; var pageSize=12; var filteredCount=0;
 // Theme Init
 if(localStorage.getItem('theme')==='dark') document.documentElement.setAttribute('data-theme','dark');
 function toggleTheme() {
@@ -552,25 +620,41 @@ function updateDash(arr) {
   document.getElementById('s-weak').innerText = arr.filter(e=>e.weak).length;
 }
 
+function sortedItems(arr){
+  var mode=document.getElementById('sort')?document.getElementById('sort').value:'smart';
+  return arr.slice().sort((a,b)=>{
+    if(mode==='weak' && a.weak!==b.weak) return a.weak?-1:1;
+    if(mode==='za') return (b.label||'').localeCompare(a.label||'', undefined, {sensitivity:'base'});
+    if(mode==='smart' && a.fav!==b.fav) return a.fav?-1:1;
+    return (a.label||'').localeCompare(b.label||'', undefined, {sensitivity:'base'});
+  });
+}
+function prevPage(){ if(page>1){page--;render();} }
+function nextPage(){ if(page*pageSize<filteredCount){page++;render();} }
+
 function render(){
   var q=(document.getElementById('q').value||'').toLowerCase();
-  var arr=DATA.filter(e=>!q||(e.label+' '+e.user).toLowerCase().indexOf(q)>=0);
+  var arr=sortedItems(DATA.filter(e=>!q||(e.label+' '+e.user).toLowerCase().indexOf(q)>=0));
   updateDash(DATA); // Update dash based on total data
-  
+
   if(!arr.length){document.getElementById('list').innerHTML="<div class='card' style='text-align:center'>No records found.</div>";return;}
-  
+  filteredCount=arr.length;
+  var pages=Math.max(1,Math.ceil(filteredCount/pageSize)); if(page>pages) page=pages;
+  var visible=arr.slice((page-1)*pageSize,page*pageSize);
+  document.getElementById('pageinfo').innerText='Page '+page+' / '+pages+' · '+filteredCount+' shown';
+
   // Grouping: Favs first, then Alphabetical Folders
-  var favs = arr.filter(e=>e.fav);
-  var others = arr.filter(e=>!e.fav);
-  
+  var favs = visible.filter(e=>e.fav);
+  var others = visible.filter(e=>!e.fav);
+
   var h='';
   if(favs.length) h += buildGroup('★ Favorites', favs);
-  
+
   // Smart Folders for the rest (Group by first letter of label)
   var groups = {};
   others.forEach(e=>{ var l=(e.label.charAt(0)||'#').toUpperCase(); if(!groups[l]) groups[l]=[]; groups[l].push(e); });
   Object.keys(groups).sort().forEach(k => { h += buildGroup(k, groups[k]); });
-  
+
   document.getElementById('list').innerHTML=h;
 }
 
@@ -585,6 +669,7 @@ function buildGroup(title, items) {
     "<button class='sm sec' onclick=\"tp("+e.id+",'pass')\">Pass</button>"+
     "<button class='sm sec' onclick=\"show("+e.id+")\">View</button>"+
     "<button class='sm sec' onclick=\"edit("+e.id+")\">Edit</button>"+
+    "<button class='sm warn' onclick=\"delEntry("+e.id+")\">Delete</button>"+
     "</div></div><div class='reveal' id='r"+e.id+"'></div></div>";
   });
   return h + "</div>";
@@ -592,14 +677,17 @@ function buildGroup(title, items) {
 
 function tp(id,mode){fetch('/api/type',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+id+'&mode='+mode}).then(r=>r.json()).then(j=>{if(!j.ok)alert(j.error||'Type failed');});}
 function toggleFav(id) { fetch('/api/fav',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+id}).then(()=>load()); }
+function delEntry(id){if(confirm('Delete this credential?'))fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+id}).then(()=>load());}
 
 function show(id){var el=document.getElementById('r'+id);
   if(el.style.display=='block'){el.style.display='none';return;}
   fetch('/api/secret?id='+id).then(r=>r.json()).then(j=>{
     var code=j.totp?(' | 2FA: '+j.totp):'';
     el.innerHTML='USR: '+esc(j.user)+'<br>PWD: '+esc(j.pass)+code+
-      "<br><button class='sm sec' style='margin-top:6px' onclick=\"navigator.clipboard.writeText('"+(j.pass||'').replace(/'/g,"\\'")+"')\">Copy Pass</button>";
+      "<br><button class='sm sec' style='margin-top:6px' onclick=\"copyPass("+id+")\">Copy Pass</button>";
+    el.dataset.pass=j.pass||'';
     el.style.display='block';});}
+function copyPass(id){var el=document.getElementById('r'+id);navigator.clipboard.writeText(el.dataset.pass||'');}
 
 function edit(id){var e=DATA.find(x=>x.id==id);if(!e)return;
   fetch('/api/secret?id='+id).then(r=>r.json()).then(j=>{
@@ -614,6 +702,7 @@ function clearForm(){editId=0;nl.value='';nu.value='';np.value='';nt.value='';nf
   document.getElementById('cancel').style.display='none';am.innerText='';}
 
 function save(){var l=nl.value.trim();if(!l){am.innerText='Label required';return;}
+  if(l.length>64||nu.value.length>96||np.value.length>128||nt.value.length>96){am.innerText='One or more fields exceeds the allowed length.';return;}
   var body=(editId?'id='+editId+'&':'')+'label='+encodeURIComponent(l)+'&user='+encodeURIComponent(nu.value)+
     '&pass='+encodeURIComponent(np.value)+'&totp='+encodeURIComponent(nt.value)+
     '&enter='+ne.value+'&spd='+nd.value+'&fav='+(nf.checked?'1':'0');
@@ -622,10 +711,10 @@ function save(){var l=nl.value.trim();if(!l){am.innerText='Label required';retur
 
 function setupDecoy(){
   var p=prompt("Enter a new PIN for the Decoy Vault:");
-  if(p&&p.length>=4){
+  if(p&&p.length>=6&&p.length<=64){
     fetch('/api/setup_decoy',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'pin='+encodeURIComponent(p)})
     .then(r=>r.json()).then(j=>{if(j.ok){alert("Decoy Created. Lock vault and test the new PIN.");}else{alert("Failed");}});
-  }else if(p){alert("PIN too short");}
+  }else if(p){alert("PIN must be 6-64 characters");}
 }
 
 function setble(on){if(confirm('Restarts device. Continue?')){fetch('/api/setble?on='+on,{method:'POST'});}}
@@ -646,21 +735,21 @@ void handleRoot() {
 void handleSetup() {
   if (vaultExists()) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Vault exists\"}"); return; }
   String pin = server.arg("pin");
-  if (pin.length()<4) { server.send(200,"application/json","{\"ok\":false,\"error\":\"PIN too short\"}"); return; }
+  if (!validPin(pin)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"PIN must be 6-64 characters\"}"); return; }
   if (createVault(pin, false)) { saveFail(0); newSession();
-    server.sendHeader("Set-Cookie","sid="+g_session+"; Path=/; HttpOnly");
+    server.sendHeader("Set-Cookie","sid="+g_session+"; Path=/; HttpOnly; SameSite=Strict");
     server.send(200,"application/json","{\"ok\":true}");
   } else server.send(200,"application/json","{\"ok\":false,\"error\":\"Create failed\"}");
 }
 void apiSetupDecoy() {
   if (!authed()) { server.send(401,"application/json","{\"error\":\"locked\"}"); return; }
   String pin = server.arg("pin");
-  if (pin.length()<4) { server.send(200,"application/json","{\"ok\":false,\"error\":\"PIN too short\"}"); return; }
+  if (!validPin(pin)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"PIN must be 6-64 characters\"}"); return; }
   // Save current main vault state to memory
   std::vector<Entry> backup = g_entries;
   uint16_t b_id = g_nextId;
-  
-  if (createVault(pin, true)) { 
+
+  if (createVault(pin, true)) {
     // Restore state back to main vault
     g_entries = backup; g_nextId = b_id; g_isDecoy = false;
     server.send(200,"application/json","{\"ok\":true}");
@@ -676,7 +765,7 @@ void handleUnlock() {
     uint32_t d = (uint32_t)(g_failCount - DELAY_THRESHOLD + 1) * 2000UL;
     if (d > 15000UL) d = 15000UL; delay(d);
   }
-  
+
   String bootpin = server.arg("bootpin");
   String pin = server.arg("pin");
 
@@ -685,7 +774,7 @@ void handleUnlock() {
   int res = unlockVault(pin);
   if (res == 0) {
     saveFail(0); newSession();
-    server.sendHeader("Set-Cookie","sid="+g_session+"; Path=/; HttpOnly");
+    server.sendHeader("Set-Cookie","sid="+g_session+"; Path=/; HttpOnly; SameSite=Strict");
     server.send(200,"application/json","{\"ok\":true}");
   } else if (res == 2) {
     server.send(200,"application/json","{\"ok\":false,\"msg\":\"Low memory - restarting...\"}"); delay(300); ESP.restart();
@@ -711,15 +800,15 @@ void apiStatus() {
 
 // Very basic password strength check for UI transmission
 bool isWeak(const String& p) {
-    int s=0; 
-    if(p.length()>7)s++; 
-    for(size_t i=0;i<p.length();i++){ 
-        if(p[i]>='A'&&p[i]<='Z'){s++;break;} 
+    int s=0;
+    if(p.length()>7)s++;
+    for(size_t i=0;i<p.length();i++){
+        if(p[i]>='A'&&p[i]<='Z'){s++;break;}
     }
-    for(size_t i=0;i<p.length();i++){ 
-        if(p[i]>='0'&&p[i]<='9'){s++;break;} 
+    for(size_t i=0;i<p.length();i++){
+        if(p[i]>='0'&&p[i]<='9'){s++;break;}
     }
-    return s < 2; 
+    return s < 2;
 }
 
 void apiList() {
@@ -746,10 +835,10 @@ void apiSecret() {
 }
 
 void fillFromArgs(Entry& e) {
-  e.label = sanitize(server.arg("label"));
-  e.user  = sanitize(server.arg("user"));
-  e.pass  = sanitize(server.arg("pass"));
-  e.totp  = sanitize(server.arg("totp")); e.totp.replace(" ","");
+  e.label = truncateField(sanitize(server.arg("label")), MAX_LABEL_LEN);
+  e.user  = truncateField(sanitize(server.arg("user")), MAX_USER_LEN);
+  e.pass  = truncateField(sanitize(server.arg("pass")), MAX_PASS_LEN);
+  e.totp  = truncateField(sanitize(server.arg("totp")), MAX_TOTP_LEN); e.totp.replace(" ","");
   e.enter = (server.arg("enter")=="1");
   e.fav   = (server.arg("fav")=="1");
   int spd = server.arg("spd").toInt(); if (spd<0) spd=0;
@@ -759,11 +848,13 @@ void fillFromArgs(Entry& e) {
 void apiAdd() {
   if (!authed()) { server.send(401,"application/json","{\"error\":\"locked\"}"); return; }
   if ((int)g_entries.size() >= MAX_ENTRIES) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Vault is full\"}"); return; }
-  
-  String nLabel = sanitize(server.arg("label"));
-  String nUser = sanitize(server.arg("user"));
+
+  String nLabel = truncateField(sanitize(server.arg("label")), MAX_LABEL_LEN);
+  String nUser = truncateField(sanitize(server.arg("user")), MAX_USER_LEN);
   if (nLabel.length()==0) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Label required\"}"); return; }
-  
+  String nTotp = truncateField(sanitize(server.arg("totp")), MAX_TOTP_LEN); nTotp.replace(" ","");
+  if (!validTotpSecret(nTotp)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Invalid TOTP secret\"}"); return; }
+
   // Duplicate Check
   for(auto& existing : g_entries) {
       if(existing.label.equalsIgnoreCase(nLabel) && existing.user.equalsIgnoreCase(nUser)) {
@@ -780,8 +871,10 @@ void apiUpdate() {
   if (!authed()) { server.send(401,"application/json","{\"error\":\"locked\"}"); return; }
   Entry* e = findEntry((uint16_t)server.arg("id").toInt());
   if (!e) { server.send(404,"application/json","{\"ok\":false,\"error\":\"not found\"}"); return; }
-  if (sanitize(server.arg("label")).length()==0) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Label required\"}"); return; }
-  
+  if (truncateField(sanitize(server.arg("label")), MAX_LABEL_LEN).length()==0) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Label required\"}"); return; }
+  String nTotp = truncateField(sanitize(server.arg("totp")), MAX_TOTP_LEN); nTotp.replace(" ","");
+  if (!validTotpSecret(nTotp)) { server.send(200,"application/json","{\"ok\":false,\"error\":\"Invalid TOTP secret\"}"); return; }
+
   uint16_t id = e->id; Entry tmp; tmp.id=id; fillFromArgs(tmp);
   *e = tmp;
   if (saveVault()) server.send(200,"application/json","{\"ok\":true}");
@@ -799,6 +892,7 @@ void apiFav() {
   if (!authed()) { server.send(401,"application/json","{\"error\":\"locked\"}"); return; }
   Entry* e = findEntry((uint16_t)server.arg("id").toInt());
   if (e) { e->fav = !e->fav; saveVault(); server.send(200,"application/json","{\"ok\":true}"); }
+  else { server.send(404,"application/json","{\"ok\":false,\"error\":\"not found\"}"); }
 }
 
 void apiType() {
@@ -829,11 +923,11 @@ void handleNotFound() { server.sendHeader("Location", String("http://")+apIP.toS
 // ============================ Display Core =================================
 void updateScreenUI(bool forceUpdate = false) {
   static uint32_t lastDraw = 0;
-  
+
   if (millis() - lastDraw > 1000 || forceUpdate) {
     lastDraw = millis();
     tft.fillScreen(TFT_BLACK);
-    
+
     // Status Bar
     tft.fillRect(0, 0, 320, 20, TFT_DARKGREY);
     tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
@@ -842,50 +936,50 @@ void updateScreenUI(bool forceUpdate = false) {
     if (!g_unlocked) {
         // --- LOCKED: Show Fake Clock & Boot Password ---
         tft.drawString("STANDBY", 260, 2, 2);
-        
+
         uint32_t secs = millis() / 1000;
         char timeStr[9];
         sprintf(timeStr, "%02d:%02d:%02d", (secs / 3600) % 24, (secs / 60) % 60, secs % 60);
 
         tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.drawCentreString(timeStr, 160, 50, 7); 
+        tft.drawCentreString(timeStr, 160, 50, 7);
 
         tft.setTextColor(TFT_YELLOW, TFT_BLACK);
         tft.drawCentreString("SESSION PASS:", 160, 110, 2);
         tft.setTextColor(TFT_CYAN, TFT_BLACK);
         tft.drawCentreString(g_bootPass, 160, 130, 4);
-        
+
     } else if (millis() - g_lastSeen > SAVER_MS) {
         // --- SCREENSAVER ---
         tft.drawString("IDLE", 280, 2, 2);
         tft.drawRoundRect(10, 25, 300, 135, 10, TFT_BLUE);
         tft.drawRoundRect(12, 27, 296, 131, 8, TFT_DARKCYAN);
-        
+
         uint32_t secs = millis() / 1000;
         char timeStr[9]; sprintf(timeStr, "%02d:%02d:%02d", (secs / 3600) % 24, (secs / 60) % 60, secs % 60);
 
         tft.setTextColor(TFT_CYAN, TFT_BLACK);
-        tft.drawCentreString(timeStr, 160, 55, 7); 
+        tft.drawCentreString(timeStr, 160, 55, 7);
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.drawCentreString(g_isDecoy ? "Decoy Vault" : "Vault is Unlocked", 160, 115, 2);
         tft.drawCentreString("Press any button to wake", 160, 135, 2);
 
     } else {
         // --- UNLOCKED & ACTIVE ---
-        String connState = bleKeyboard.isConnected() ? "(BLE & USB)" : "(USB)"; 
+        String connState = bleKeyboard.isConnected() ? "(BLE & USB)" : "(USB)";
         tft.drawString("ACTIVE " + connState, 190, 2, 2);
-        
+
         if (g_entries.empty()) {
             tft.setTextColor(TFT_YELLOW, TFT_BLACK);
             tft.drawCentreString("Vault is Empty", 160, 80, 4);
         } else {
             if (g_selectedIndex >= g_entries.size()) g_selectedIndex = 0;
             Entry& e = g_entries[g_selectedIndex];
-            
+
             // Draw Label with Star if Favorite
             tft.setTextColor(e.fav ? TFT_YELLOW : TFT_CYAN, TFT_BLACK);
             tft.drawCentreString((e.fav ? "* " : "") + e.label + (e.fav ? " *" : ""), 160, 35, 4);
-            
+
             // Draw Username
             tft.setTextColor(TFT_WHITE, TFT_BLACK);
             tft.drawCentreString(e.user, 160, 65, 2);
@@ -915,17 +1009,17 @@ void updateScreenUI(bool forceUpdate = false) {
 
 // ================================ Setup ====================================
 void setup() {
-  Serial.begin(115200); 
+  Serial.begin(115200);
 
   pinMode(BTN_NAV, INPUT_PULLUP);
   pinMode(BTN_TYPE, INPUT_PULLUP);
-  pinMode(PIN_POWER_ON, OUTPUT); digitalWrite(PIN_POWER_ON, HIGH); delay(100); 
+  pinMode(PIN_POWER_ON, OUTPUT); digitalWrite(PIN_POWER_ON, HIGH); delay(100);
 
   USB.begin(); usbKeyboard.begin();
 
-  tft.init(); tft.setRotation(1); 
-  pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH); 
-  
+  tft.init(); tft.setRotation(1);
+  pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
+
   tft.fillScreen(TFT_BLACK); tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawCentreString("BOOTING SYSTEM...", 160, 80, 2); delay(500);
 
@@ -936,7 +1030,7 @@ void setup() {
   WiFi.softAP(AP_SSID, AP_PASS, 1, g_apHidden ? 1 : 0);
 
   dns.start(53,"*",apIP); startBleIfEnabled();
-  
+
   g_bootPass = genPassword(12);
 
   const char* hk[] = { "Cookie" }; server.collectHeaders(hk,1);
@@ -966,13 +1060,13 @@ void setup() {
 void loop() {
   dns.processNextRequest();
   server.handleClient();
-  
+
   if (g_unlocked && (millis()-g_lastSeen > LOCK_MS)) lockVault();
-  
+
   if (AP_TIMEOUT_MIN>0 && !g_apOff && (millis()-g_lastWebMs > AP_TIMEOUT_MIN*60000UL)) {
     WiFi.softAPdisconnect(true); g_apOff=true;
   }
-  
+
   if (!g_unlocked) {
     if (digitalRead(BTN_TYPE) == LOW && (millis() - lastBtnType > 1000)) {
         typeText(g_bootPass, 12); lastBtnType = millis();
@@ -984,20 +1078,20 @@ void loop() {
 
     if (isScreensaver) {
         if ((btnNavCurrent == LOW && btnNavLast == HIGH) || (btnTypeCurrent == LOW && (millis() - lastBtnType > 1000))) {
-            g_lastSeen = millis(); btnNavLast = btnNavCurrent; lastBtnType = millis(); updateScreenUI(true);       
+            g_lastSeen = millis(); btnNavLast = btnNavCurrent; lastBtnType = millis(); updateScreenUI(true);
         } else { btnNavLast = btnNavCurrent; }
     } else if (!g_entries.empty()) {
-        
+
         // Navigation (Short/Long/Hold Press)
         if (btnNavCurrent == LOW && btnNavLast == HIGH) {
             btnNavPressTime = millis(); lastFastScroll = millis();
-        } 
+        }
         else if (btnNavCurrent == LOW && btnNavLast == LOW) {
             // FAST SCROLL LOGIC
-            if (millis() - btnNavPressTime > 800) { 
-                if (millis() - lastFastScroll > 150) { 
+            if (millis() - btnNavPressTime > 800) {
+                if (millis() - lastFastScroll > 150) {
                     g_selectedIndex = (g_selectedIndex + 1) % g_entries.size();
-                    g_lastSeen = millis(); g_typeTotpNext = false; 
+                    g_lastSeen = millis(); g_typeTotpNext = false;
                     updateScreenUI(true);
                     lastFastScroll = millis();
                 }
@@ -1008,21 +1102,21 @@ void loop() {
             if (pressDuration > 50 && pressDuration <= 800) {
                 // Regular Short Press
                 g_selectedIndex = (g_selectedIndex + 1) % g_entries.size();
-                g_lastSeen = millis(); g_typeTotpNext = false; updateScreenUI(true);  
+                g_lastSeen = millis(); g_typeTotpNext = false; updateScreenUI(true);
             }
         }
         btnNavLast = btnNavCurrent;
-        
+
         // Typing Logic
         if (btnTypeCurrent == LOW && (millis() - lastBtnType > 1000)) {
             Entry& currentEntry = g_entries[g_selectedIndex];
             if (!g_typeTotpNext) {
                 doType(&currentEntry, "pass");
-                if (currentEntry.totp.length() > 0) g_typeTotpNext = true; 
+                if (currentEntry.totp.length() > 0) g_typeTotpNext = true;
             } else {
-                doType(&currentEntry, "totp"); g_typeTotpNext = false; 
+                doType(&currentEntry, "totp"); g_typeTotpNext = false;
             }
-            lastBtnType = millis(); g_lastSeen = millis(); updateScreenUI(true); 
+            lastBtnType = millis(); g_lastSeen = millis(); updateScreenUI(true);
         }
     } else { btnNavLast = btnNavCurrent; }
   }
